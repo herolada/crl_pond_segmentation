@@ -124,6 +124,22 @@ def as_name_list(names: dict[int, str]) -> list[str]:
         return ["object"]
     return [names[index] for index in sorted(names)]
 
+def letterbox(image: np.ndarray, size: int, color=(24, 24, 24)) -> np.ndarray:
+    h, w = image.shape[:2]
+
+    scale = min(size / w, size / h)
+    nw = int(round(w * scale))
+    nh = int(round(h * scale))
+
+    resized = cv2.resize(image, (nw, nh), interpolation=cv2.INTER_AREA)
+
+    canvas = np.full((size, size, 3), color, dtype=np.uint8)
+
+    x = (size - nw) // 2
+    y = (size - nh) // 2
+
+    canvas[y:y+nh, x:x+nw] = resized
+    return canvas
 
 def parse_label_line(line: str) -> tuple[int, list[float]] | None:
     parts = line.strip().split()
@@ -461,9 +477,14 @@ def render_preview_panel(
     predictions: list[InstanceMask],
     class_names: dict[int, str],
     sample_metrics: dict[str, float],
+    imgsz: int,
 ) -> np.ndarray:
     gt_panel = draw_instances(image_bgr, ground_truth, (0, 255, 0), "gt", class_names)
     pred_panel = draw_instances(image_bgr, predictions, (0, 0, 255), "pred", class_names)
+
+    gt_panel = letterbox(gt_panel, imgsz)
+    pred_panel = letterbox(pred_panel, imgsz)
+
     panel = stack_preview(gt_panel, pred_panel, "Segmentation Evaluation")
     summary = (
         f"IoU={sample_metrics['pixel_iou']:.3f}  Dice={sample_metrics['pixel_dice']:.3f}  "
@@ -586,6 +607,7 @@ def main() -> None:
                         "pixel_dice": image_pixel_metrics["pixel_dice"],
                         "instance_f1": sample_instance_f1,
                     },
+                    imgsz=args.imgsz,
                 )
                 preview_panels.append((sample.image_path, preview))
 

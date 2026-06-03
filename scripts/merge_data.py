@@ -3,10 +3,10 @@ import shutil
 import yaml
 
 # Folder containing your 5 datasets
-SOURCE_ROOT = Path(r"F:\prace\crl_pond_segmentation\data")
+SOURCE_ROOT = Path(r"../data")
 
 # Output merged dataset
-DEST_ROOT = Path(r"F:\prace\crl_pond_segmentation\data\merged")
+DEST_ROOT = Path(r"../merged_data")
 
 splits = ["train", "val", "test"]
 

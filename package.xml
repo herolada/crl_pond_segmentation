@@ -4,32 +4,19 @@
   <name>pond_segmentation</name>
   <version>0.1.0</version>
   <description>
-    YOLOv8s-based OPI (ADR hazard placard) detector node for ROS 2 Jazzy.
-    Localises OPI bounding boxes to 3-D positions in the map frame using solvePnP (IPPE).
+    YOLOv11n-seg pond water segmentation node for ROS 2.
+    Subscribes to one or more camera image topics, runs ONNX inference,
+    and publishes a binary mono8 segmentation mask.
   </description>
-  <maintainer email="you@example.com">Your Name</maintainer>
+  <maintainer email="herolada@fel.cvut.cz">Adam Herold</maintainer>
   <license>Apache-2.0</license>
 
   <buildtool_depend>ament_cmake</buildtool_depend>
-  <buildtool_depend>rosidl_default_generators</buildtool_depend>
 
   <depend>rclcpp</depend>
   <depend>sensor_msgs</depend>
-  <depend>vision_msgs</depend>
   <depend>cv_bridge</depend>
-  <depend>image_transport</depend>
-  <depend>nav_msgs</depend>
-  <depend>geometry_msgs</depend>
-  <depend>tf2_ros</depend>
-  <depend>tf2_geometry_msgs</depend>
   <depend>libopencv-dev</depend>
-  <depend>eigen</depend>
-  <depend>visualization_msgs</depend>
-  <depend>std_msgs</depend>
-  <depend>rosidl_default_runtime</depend>
-
-  <member_of_group>rosidl_interface_packages</member_of_group>
-
 
   <export>
     <build_type>ament_cmake</build_type>
