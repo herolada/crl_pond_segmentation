@@ -2,10 +2,11 @@
 """Train and export a YOLO segmentation model for pond-like water regions."""
 
 from __future__ import annotations
-
+import random
 import argparse
 import hashlib
 import json
+import os
 import re
 import shutil
 import tempfile
@@ -15,6 +16,7 @@ from typing import Iterable
 
 import cv2
 import numpy as np
+import torch
 import yaml
 from torch.utils.tensorboard import SummaryWriter
 from ultralytics import YOLO
@@ -25,6 +27,23 @@ PACKAGE_DIR = SCRIPT_DIR.parent
 DEFAULT_DATA_ROOT = PACKAGE_DIR / "data"
 DEFAULT_RUNS_DIR = PACKAGE_DIR / "runs" / "segmentation_training"
 IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
+
+
+def parse_batch_size(value: str) -> int | float:
+    """Accept either a fixed integer batch size or Ultralytics' AutoBatch memory fraction."""
+    try:
+        if "." in value:
+            batch_fraction = float(value)
+            if not 0.0 < batch_fraction <= 1.0:
+                raise argparse.ArgumentTypeError("AutoBatch fractions must be in the range (0.0, 1.0].")
+            return batch_fraction
+        batch_size = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("Batch must be an integer or a GPU memory fraction like 0.75.") from exc
+
+    if batch_size <= 0:
+        raise argparse.ArgumentTypeError("Batch size must be positive.")
+    return batch_size
 
 
 @dataclass(frozen=True)
@@ -70,10 +89,55 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--imgsz", type=int, default=320, help="Training and export image size.")
     parser.add_argument("--epochs", type=int, default=100, help="Maximum training epochs.")
-    parser.add_argument("--batch", type=int, default=16, help="Batch size.")
+    parser.add_argument(
+        "--batch",
+        type=parse_batch_size,
+        default=16,
+        help=(
+            "Batch size. Use an integer for a fixed batch, or a float in (0, 1] to let "
+            "Ultralytics AutoBatch target that fraction of GPU memory. "
+            "NOTE: AutoBatch requires cudnn.benchmark=False, which conflicts with "
+            "throughput-optimised training. Use an explicit integer batch size when possible."
+        ),
+    )
     parser.add_argument("--device", default="0", help='Training device, e.g. "0", "0,1", or "cpu".')
-    parser.add_argument("--workers", type=int, default=8, help="Data loader workers.")
-    parser.add_argument("--patience", type=int, default=20, help="Early stopping patience.")
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=2,
+        help="Data loader workers. Lower values use much less RAM in WSL; raise if the GPU is still starved.",
+    )
+    parser.add_argument(
+        "--prefetch-factor",
+        type=int,
+        default=2,
+        help="Number of batches each data loader worker preloads. Lower values reduce RAM pressure.",
+    )
+    parser.add_argument(
+        "--buffer-images",
+        type=int,
+        default=128,
+        help="Cap Ultralytics' in-RAM augmentation image buffer. Lower values reduce RAM during mosaic training.",
+    )
+    parser.add_argument(
+        "--pin-memory",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Pin CUDA transfer buffers. Disable with --no-pin-memory if host RAM is still tight.",
+    )
+    parser.add_argument(
+        "--cache",
+        choices=("false", "ram", "disk"),
+        default="false",
+        help="Ultralytics image cache mode. Keep false for lowest RAM use; disk can help if storage is fast.",
+    )
+    parser.add_argument(
+        "--deterministic",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Enable deterministic CUDA ops. Disabled by default for better GPU throughput.",
+    )
+    parser.add_argument("--patience", type=int, default=10, help="Early stopping patience.")
     parser.add_argument(
         "--project",
         type=Path,
@@ -144,6 +208,16 @@ def parse_args() -> argparse.Namespace:
         default="water",
         help="Class name to use when --class-mode single is selected.",
     )
+    parser.add_argument(
+        "--fix-labels",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Scan and fix label files that have mismatched box/segment counts before training. "
+            "Lines with a bounding-box entry but no polygon (or vice-versa) are removed. "
+            "Enabled by default; use --no-fix-labels to skip."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -170,11 +244,18 @@ def slugify(value: str) -> str:
 
 
 def unique_sample_stem(source: DatasetSource, split: str, image_path: Path) -> str:
-    relative = image_path.relative_to(source.root)
-    relative_without_suffix = relative.with_suffix("")
-    digest = hashlib.sha1(str(image_path).encode("utf-8")).hexdigest()[:10]
-    parts = [source.root.name, split, *relative_without_suffix.parts, digest]
-    return slugify("__".join(parts))
+    """Return a short, unique filename stem for a merged-dataset sample.
+
+    The full path is hashed so that the stem is always exactly 24 characters:
+    an 8-char dataset prefix + '_' + 16-char SHA-1 hex digest.  This keeps
+    merged paths well within Windows' 260-char MAX_PATH limit even when the
+    project directory is deeply nested.
+    """
+    digest = hashlib.sha1(str(image_path).encode("utf-8")).hexdigest()[:16]
+    # Take up to 8 slugified chars from the dataset root name as a human-
+    # readable prefix so files remain identifiable in a file browser.
+    prefix = slugify(source.root.name)[:8].rstrip("_")
+    return f"{prefix}_{digest}"
 
 
 def resolve_source_root_from_yaml(dataset_yaml: Path, data_config: dict) -> Path:
@@ -282,8 +363,24 @@ def source_label_path(split_dir: Path, image_path: Path) -> Path:
 
 
 def parse_label_line(line: str) -> tuple[int, list[float]] | None:
+    """Parse one YOLO segmentation label line.
+
+    A valid segmentation line has the form:
+        <class_id> x1 y1 x2 y2 ... xN yN
+    where N >= 3, so at minimum 7 values (1 class + 6 coords).
+    The coordinate count must be even (pairs of x,y).
+
+    Returns None for any line that doesn't meet these criteria so that
+    detect-only boxes (5 values) and malformed lines are silently skipped.
+    This prevents the Ultralytics "segment counts != box counts" crash.
+    """
     parts = line.strip().split()
-    if len(parts) < 7 or len(parts) % 2 == 0:
+    if len(parts) < 7:
+        # Fewer than 3 polygon points — could be a bounding-box-only line (5
+        # values) or garbage.  Skip it so segment counts stay in sync.
+        return None
+    # Coordinate count must be even (x,y pairs).
+    if (len(parts) - 1) % 2 != 0:
         return None
     try:
         class_id = int(float(parts[0]))
@@ -291,6 +388,43 @@ def parse_label_line(line: str) -> tuple[int, list[float]] | None:
     except ValueError:
         return None
     return class_id, coords
+
+
+def _count_label_file_issues(label_path: Path) -> int:
+    """Return the number of lines in *label_path* that would be dropped by parse_label_line."""
+    if not label_path.exists():
+        return 0
+    count = 0
+    with label_path.open("r", encoding="utf-8") as fh:
+        for line in fh:
+            if line.strip() and parse_label_line(line) is None:
+                count += 1
+    return count
+
+
+def fix_label_files(labels_dir: Path) -> tuple[int, int]:
+    """Remove non-polygon lines from every .txt file under *labels_dir*.
+
+    Returns (files_changed, lines_removed).
+    """
+    files_changed = 0
+    lines_removed = 0
+    for label_path in sorted(labels_dir.rglob("*.txt")):
+        kept: list[str] = []
+        dropped = 0
+        with label_path.open("r", encoding="utf-8") as fh:
+            for raw_line in fh:
+                if not raw_line.strip():
+                    continue
+                if parse_label_line(raw_line) is None:
+                    dropped += 1
+                else:
+                    kept.append(raw_line.rstrip())
+        if dropped:
+            label_path.write_text("\n".join(kept) + ("\n" if kept else ""), encoding="utf-8")
+            files_changed += 1
+            lines_removed += dropped
+    return files_changed, lines_removed
 
 
 def remap_label_file(
@@ -312,6 +446,8 @@ def remap_label_file(
         for raw_line in handle:
             parsed = parse_label_line(raw_line)
             if parsed is None:
+                # Skip bounding-box-only or malformed lines to keep segment
+                # counts consistent with box counts inside each label file.
                 continue
             class_id, coords = parsed
             if class_mode == "single":
@@ -331,14 +467,108 @@ def remap_label_file(
     destination_label_path.write_text("\n".join(rewritten_lines) + ("\n" if rewritten_lines else ""), encoding="utf-8")
 
 
+def _windows_longpath(p: Path) -> str:
+    r"""Return a \\?\-prefixed absolute path string to bypass MAX_PATH on Windows."""
+    resolved = str(p.resolve())
+    if resolved.startswith("\\\\"):
+        # UNC path  ->  \\?\UNC\<server>\<share>\...
+        return "\\\\?\\UNC\\" + resolved[2:]
+    # Regular drive path  ->  \\?\C:\...
+    return "\\\\?\\" + resolved
+
+
 def link_or_copy_file(source_path: Path, destination_path: Path) -> None:
     destination_path.parent.mkdir(parents=True, exist_ok=True)
     if destination_path.exists() or destination_path.is_symlink():
         destination_path.unlink()
     try:
         destination_path.symlink_to(source_path)
-    except OSError:
-        shutil.copy2(source_path, destination_path)
+    except (OSError, NotImplementedError):
+        # Symlinks require Developer Mode or admin rights on Windows; fall back
+        # to a plain copy.  Use the \?\  long-path prefix on Windows so that
+        # paths longer than MAX_PATH (260 chars) work without a registry tweak.
+        if os.name == "nt":
+            import ctypes
+            src = _windows_longpath(source_path)
+            dst = _windows_longpath(destination_path)
+            ok = ctypes.windll.kernel32.CopyFileW(src, dst, False)
+            if not ok:
+                err = ctypes.get_last_error()
+                raise OSError(err, f"CopyFileW failed (error {err}): {src!r} -> {dst!r}")
+        else:
+            shutil.copy2(source_path, destination_path)
+
+
+def cache_override(cache_mode: str) -> bool | str:
+    return False if cache_mode == "false" else cache_mode
+
+
+def configure_training_runtime(args: argparse.Namespace) -> None:
+    """Tune process-wide CPU/GPU settings before Ultralytics builds loaders and models."""
+    cv2.setNumThreads(0)
+
+    using_cuda = str(args.device).lower() != "cpu" and torch.cuda.is_available()
+    if using_cuda:
+        # AutoBatch requires cudnn.benchmark=False to compute memory usage
+        # reliably.  When the user supplies a float batch size we therefore
+        # force benchmark off regardless of --deterministic.
+        using_autobatch = isinstance(args.batch, float)
+        if using_autobatch:
+            torch.backends.cudnn.benchmark = False
+        else:
+            torch.backends.cudnn.benchmark = not args.deterministic
+
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+        torch.set_float32_matmul_precision("high")
+
+
+def patch_ultralytics_dataloader(args: argparse.Namespace) -> None:
+    """Expose Ultralytics dataloader pin-memory and prefetch knobs without modifying site-packages."""
+    from torch.utils.data import distributed
+    from ultralytics.data import build as data_build
+    from ultralytics.models.yolo.detect import train as detect_train
+
+    def build_dataloader(
+        dataset,
+        batch: int,
+        workers: int,
+        shuffle: bool = True,
+        rank: int = -1,
+        drop_last: bool = False,
+        pin_memory: bool = True,
+    ):
+        batch = min(batch, len(dataset))
+        if getattr(dataset, "max_buffer_length", 0):
+            dataset.max_buffer_length = min(dataset.max_buffer_length, args.buffer_images)
+        cuda_device_count = torch.cuda.device_count()
+        max_workers = (os.cpu_count() or 1) // max(cuda_device_count, 1)
+        worker_count = max(0, min(max_workers, workers))
+        sampler = (
+            None
+            if rank == -1
+            else distributed.DistributedSampler(dataset, shuffle=shuffle)
+            if shuffle
+            else data_build.ContiguousDistributedSampler(dataset)
+        )
+        generator = torch.Generator()
+        generator.manual_seed(6148914691236517205 + data_build.RANK)
+        return data_build.InfiniteDataLoader(
+            dataset=dataset,
+            batch_size=batch,
+            shuffle=shuffle and sampler is None,
+            num_workers=worker_count,
+            sampler=sampler,
+            prefetch_factor=args.prefetch_factor if worker_count > 0 else None,
+            pin_memory=cuda_device_count > 0 and pin_memory and args.pin_memory,
+            collate_fn=getattr(dataset, "collate_fn", None),
+            worker_init_fn=data_build.seed_worker,
+            generator=generator,
+            drop_last=drop_last and len(dataset) % batch != 0,
+        )
+
+    data_build.build_dataloader = build_dataloader
+    detect_train.build_dataloader = build_dataloader
 
 
 def build_merged_dataset(
@@ -382,12 +612,12 @@ def build_merged_dataset(
                 unique_stem = unique_sample_stem(source, normalized_split, image_path)
                 destination_image = merged_root / normalized_split / "images" / f"{unique_stem}{image_path.suffix.lower()}"
                 destination_label = merged_root / normalized_split / "labels" / f"{unique_stem}.txt"
-                source_label = source_label_path(split_dir, image_path)
+                src_label = source_label_path(split_dir, image_path)
 
                 link_or_copy_file(image_path, destination_image)
                 remap_label_file(
                     source=source,
-                    source_label_path=source_label,
+                    source_label_path=src_label,
                     destination_label_path=destination_label,
                     class_mode=class_mode,
                     global_class_names=global_class_names,
@@ -609,13 +839,20 @@ class TrainingMonitor:
         epoch_dir.mkdir(parents=True, exist_ok=True)
 
         for sample in self.val_samples:
-            image_bgr = cv2.imread(str(sample.image_path))
+            if isinstance(sample, tuple):
+                image_path = Path(sample[0])
+                label_path = Path(sample[1])
+            else:
+                image_path = sample.image_path
+                label_path = sample.label_path
+
+            image_bgr = cv2.imread(str(image_path))
             if image_bgr is None:
                 continue
 
-            gt_polygons = load_segmentation_labels(sample.label_path, image_bgr.shape)
+            gt_polygons = load_segmentation_labels(label_path, image_bgr.shape)
             prediction = predictor.predict(
-                source=str(sample.image_path),
+                source=str(image_path),
                 imgsz=self.args.imgsz,
                 conf=self.args.conf,
                 iou=self.args.iou,
@@ -627,14 +864,14 @@ class TrainingMonitor:
                 draw_ground_truth(image_bgr, gt_polygons),
                 draw_predictions(image_bgr, prediction),
             )
-            preview_path = epoch_dir / f"{sample.image_path.stem}_preview.jpg"
+            preview_path = epoch_dir / f"{image_path.stem}_preview.jpg"
             cv2.imwrite(str(preview_path), preview)
 
             if self.writer:
                 rgb_preview = cv2.cvtColor(preview, cv2.COLOR_BGR2RGB)
                 chw_preview = np.transpose(rgb_preview, (2, 0, 1))
                 self.writer.add_image(
-                    tag=f"val_previews/{sample.image_path.stem}",
+                    tag=f"val_previews/{image_path.stem}",
                     img_tensor=chw_preview,
                     global_step=epoch,
                 )
@@ -649,11 +886,15 @@ def training_overrides(args: argparse.Namespace) -> dict:
         "batch": args.batch,
         "device": args.device,
         "workers": args.workers,
+        "cache": cache_override(args.cache),
         "patience": args.patience,
         "project": str(args.project.resolve()),
         "name": run_name,
         "exist_ok": True,
         "pretrained": True,
+        "amp": True,
+        "deterministic": args.deterministic,
+        "compile": False,
         "optimizer": "AdamW",
         "lr0": 0.001,
         "lrf": 0.01,
@@ -676,7 +917,7 @@ def training_overrides(args: argparse.Namespace) -> dict:
         "copy_paste_mode": "flip",
         "auto_augment": "randaugment",
         "erasing": 0.4,
-        "crop_fraction": 1.0,
+        # "crop_fraction" removed — deprecated in recent Ultralytics versions.
         "plots": True,
         "save": True,
         "save_period": args.preview_interval,
@@ -687,10 +928,19 @@ def training_overrides(args: argparse.Namespace) -> dict:
 
 def main() -> None:
     args = parse_args()
+    if args.workers < 0:
+        raise ValueError("--workers must be zero or greater.")
+    if args.prefetch_factor < 1:
+        raise ValueError("--prefetch-factor must be at least 1.")
+    if args.buffer_images < 1:
+        raise ValueError("--buffer-images must be at least 1.")
+
     args.data = args.data.resolve()
     args.project = args.project.resolve()
     args.project.mkdir(parents=True, exist_ok=True)
     (args.project / "_dataset_cache").mkdir(parents=True, exist_ok=True)
+    configure_training_runtime(args)
+    patch_ultralytics_dataloader(args)
 
     prepared_dataset = build_merged_dataset(
         data_path=args.data,
@@ -698,6 +948,25 @@ def main() -> None:
         class_mode=args.class_mode,
         single_class_name=args.single_class_name,
     )
+
+    # Optionally clean label files in the merged dataset before training to
+    # ensure box and segment counts are equal.  This prevents the Ultralytics
+    # "WARNING Box and segment counts should be equal" crash.
+    if args.fix_labels:
+        for split in ("train", "val", "test"):
+            labels_dir = prepared_dataset.root_dir / split / "labels"
+            if labels_dir.exists():
+                files_changed, lines_removed = fix_label_files(labels_dir)
+                if files_changed:
+                    print(
+                        f"fix_labels [{split}]: removed {lines_removed} non-polygon "
+                        f"line(s) from {files_changed} file(s)."
+                    )
+        # Invalidate any stale Ultralytics label caches so they are rebuilt
+        # from the cleaned files.
+        for cache_file in prepared_dataset.root_dir.rglob("labels.cache"):
+            cache_file.unlink(missing_ok=True)
+
     args.data = prepared_dataset.yaml_path
     val_samples = prepared_dataset.val_samples[: args.preview_count]
     if not val_samples:
