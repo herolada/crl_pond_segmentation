@@ -218,6 +218,49 @@ def parse_args() -> argparse.Namespace:
             "Enabled by default; use --no-fix-labels to skip."
         ),
     )
+    parser.add_argument(
+        "--lr0",
+        type=float,
+        default=None,
+        help=(
+            "Initial learning rate. Defaults to 0.001 when not set. "
+            "Pass the value suggested by --lr-finder here to use it for a full training run."
+        ),
+    )
+    parser.add_argument(
+        "--lr-finder",
+        action="store_true",
+        help=(
+            "Run a learning-rate range test (Leslie Smith) instead of a full training run. "
+            "Sweeps lr exponentially from --lr-finder-start-lr to --lr-finder-end-lr, records "
+            "the smoothed loss, saves a plot, and prints a suggested lr0. "
+            "Re-run without this flag (and with --lr0 <suggested>) to do the actual training."
+        ),
+    )
+    parser.add_argument(
+        "--lr-finder-start-lr",
+        type=float,
+        default=1e-7,
+        help="Minimum learning rate for the LR range test.",
+    )
+    parser.add_argument(
+        "--lr-finder-end-lr",
+        type=float,
+        default=10.0,
+        help="Maximum learning rate for the LR range test.",
+    )
+    parser.add_argument(
+        "--lr-finder-num-iter",
+        type=int,
+        default=200,
+        help="Maximum number of mini-batches to run during the LR range test.",
+    )
+    parser.add_argument(
+        "--lr-finder-stop-factor",
+        type=float,
+        default=4.0,
+        help="Abort the range test when smoothed loss exceeds best_loss * stop_factor (divergence guard).",
+    )
     return parser.parse_args()
 
 
@@ -877,6 +920,147 @@ class TrainingMonitor:
                 )
 
 
+class _LrFinderStop(BaseException):
+    """Raised from an Ultralytics callback to abort the LR range test mid-epoch."""
+
+
+class LrFinderMonitor:
+    """Records exponentially-increasing LR and the corresponding smoothed loss."""
+
+    def __init__(self, start_lr: float, end_lr: float, num_iter: int, stop_factor: float) -> None:
+        self.start_lr = start_lr
+        self.end_lr = end_lr
+        self.num_iter = num_iter
+        self.stop_factor = stop_factor
+        self._lr_mult = (end_lr / start_lr) ** (1.0 / num_iter)
+        self._iter = 0
+        self._beta = 0.98
+        self._avg_loss = 0.0
+        self._best_loss = float("inf")
+        self.lrs: list[float] = []
+        self.losses: list[float] = []
+        self.run_dir: Path | None = None
+
+    def on_train_start(self, trainer) -> None:
+        self.run_dir = Path(trainer.save_dir)
+
+    def on_train_batch_start(self, trainer) -> None:
+        # Override the LR that Ultralytics' warmup scheduler may have just set.
+        current_lr = self.start_lr * (self._lr_mult ** self._iter)
+        for pg in trainer.optimizer.param_groups:
+            pg["lr"] = current_lr
+
+    def on_train_batch_end(self, trainer) -> None:
+        current_lr = self.start_lr * (self._lr_mult ** self._iter)
+        loss = float(trainer.loss.detach().cpu())
+
+        # Exponential moving average with bias correction (same as fast.ai LR finder).
+        self._avg_loss = self._beta * self._avg_loss + (1 - self._beta) * loss
+        smoothed = self._avg_loss / (1 - self._beta ** (self._iter + 1))
+
+        self.lrs.append(current_lr)
+        self.losses.append(smoothed)
+
+        if smoothed < self._best_loss:
+            self._best_loss = smoothed
+
+        self._iter += 1
+        if self._iter >= self.num_iter or smoothed > self.stop_factor * self._best_loss:
+            raise _LrFinderStop
+
+    def suggest_lr(self) -> float | None:
+        """Return the LR at the point of steepest loss descent."""
+        if len(self.losses) < 5:
+            return None
+        log_lrs = np.log10(self.lrs)
+        gradients = np.gradient(np.array(self.losses), log_lrs)
+        # Exclude the final 10 % of points (divergence zone) before searching.
+        cutoff = max(1, len(gradients) - max(5, len(gradients) // 10))
+        return self.lrs[int(np.argmin(gradients[:cutoff]))]
+
+    def save_plot(self, output_path: Path) -> None:
+        try:
+            import matplotlib
+            matplotlib.use("Agg")
+            import matplotlib.pyplot as plt
+        except ImportError:
+            print("matplotlib not available — skipping LR finder plot.")
+            return
+
+        fig, ax = plt.subplots(figsize=(10, 5))
+        ax.semilogx(self.lrs, self.losses)
+        ax.set_xlabel("Learning Rate (log scale)")
+        ax.set_ylabel("Smoothed Loss")
+        ax.set_title("LR Finder — Loss vs Learning Rate")
+        ax.grid(True, which="both", alpha=0.4)
+
+        suggested = self.suggest_lr()
+        if suggested is not None:
+            ax.axvline(x=suggested, color="red", linestyle="--", label=f"Suggested LR: {suggested:.2e}")
+            ax.legend()
+
+        fig.savefig(str(output_path), dpi=150, bbox_inches="tight")
+        plt.close(fig)
+
+
+def run_lr_finder(args: argparse.Namespace, prepared_dataset: PreparedDataset) -> None:
+    """Run an LR range test, save a loss-vs-LR plot, and print the suggested lr0."""
+    monitor = LrFinderMonitor(
+        start_lr=args.lr_finder_start_lr,
+        end_lr=args.lr_finder_end_lr,
+        num_iter=args.lr_finder_num_iter,
+        stop_factor=args.lr_finder_stop_factor,
+    )
+
+    run_name = (args.name or Path(args.model).stem) + "_lr_finder"
+    overrides = {
+        **training_overrides(args),
+        "data": str(prepared_dataset.yaml_path),
+        "epochs": 1,
+        "patience": 0,
+        "save": False,
+        "val": False,
+        "plots": False,
+        "name": run_name,
+        "verbose": False,
+    }
+
+    model = YOLO(args.model)
+    model.add_callback("on_train_start", monitor.on_train_start)
+    model.add_callback("on_train_batch_start", monitor.on_train_batch_start)
+    model.add_callback("on_train_batch_end", monitor.on_train_batch_end)
+
+    print(
+        f"LR finder: sweeping lr {args.lr_finder_start_lr:.1e} → {args.lr_finder_end_lr:.1e} "
+        f"over up to {args.lr_finder_num_iter} batches …"
+    )
+    try:
+        model.train(**overrides)
+    except _LrFinderStop:
+        pass
+    except Exception as exc:
+        if not monitor.lrs:
+            raise
+        # Absorb finalisation errors that Ultralytics may raise after the mid-epoch abort.
+        print(f"LR finder: training interrupted ({exc})")
+
+    if not monitor.lrs:
+        print("LR finder: no data collected — check your dataset and model configuration.")
+        return
+
+    if monitor.run_dir is not None:
+        plot_path = monitor.run_dir / "lr_finder.png"
+        monitor.save_plot(plot_path)
+        print(f"LR finder plot: {plot_path}")
+
+    suggested = monitor.suggest_lr()
+    if suggested is not None:
+        print(f"LR finder: suggested lr0 = {suggested:.2e}  (point of steepest loss descent)")
+        print(f"           Re-run with --lr0 {suggested:.2e} to train with this learning rate.")
+    else:
+        print("LR finder: not enough data to suggest a learning rate — try a wider range.")
+
+
 def training_overrides(args: argparse.Namespace) -> dict:
     run_name = args.name or Path(args.model).stem
     return {
@@ -896,7 +1080,7 @@ def training_overrides(args: argparse.Namespace) -> dict:
         "deterministic": args.deterministic,
         "compile": False,
         "optimizer": "AdamW",
-        "lr0": 0.001,
+        "lr0": args.lr0 if args.lr0 is not None else 0.001,
         "lrf": 0.01,
         "cos_lr": True,
         "weight_decay": 0.001,
@@ -966,6 +1150,10 @@ def main() -> None:
         # from the cleaned files.
         for cache_file in prepared_dataset.root_dir.rglob("labels.cache"):
             cache_file.unlink(missing_ok=True)
+
+    if args.lr_finder:
+        run_lr_finder(args, prepared_dataset)
+        return
 
     args.data = prepared_dataset.yaml_path
     val_samples = prepared_dataset.val_samples[: args.preview_count]
