@@ -18,7 +18,7 @@ def generate_launch_description():
             description="Rotate the input image 180° before inference (for upside-down cameras)",
         ),
         DeclareLaunchArgument(
-            "detection_hz",
+            "segmentation_hz",
             default_value="0.0",
             description="Max segmentation rate in Hz per camera topic; 0.0 means every frame",
         ),
@@ -33,19 +33,19 @@ def generate_launch_description():
             output="screen",
             parameters=[{
                 # Path to the ONNX model file installed with the package
-                "model_path": get_package_share_directory("pond_segmentation") + "/models/best.onnx",
+                "model_path": get_package_share_directory("pond_segmentation") + "/models/best_dgx.onnx",
 
                 # List of image topics to run inference on (one mask published per topic)
                 "camera_topics": ["camera/image_raw"],
 
                 # Minimum confidence score for a YOLO detection to be kept before NMS
-                "conf_threshold": 0.2,
+                "conf_threshold": 0.4,
 
                 # IoU overlap threshold for Non-Maximum Suppression
                 "nms_threshold": 0.45,
 
                 # Sigmoid output threshold for binarising the mask (0 = background, 255 = water)
-                "mask_threshold": 0.2,
+                "mask_threshold": 0.4,
 
                 # Model input resolution — must match what the ONNX was exported with
                 "input_width": 320,
@@ -55,7 +55,7 @@ def generate_launch_description():
                 "rotate_image_180": LaunchConfiguration("rotate_image_180"),
 
                 # Max inference rate per camera topic; set via launch arg (0.0 = every frame)
-                "segmentation_hz": LaunchConfiguration("detection_hz"),
+                "segmentation_hz": LaunchConfiguration("segmentation_hz"),
 
                 # Base output topic; mask is published on <output_topic>/image_raw (mono8)
                 "output_topic": "pond/segmentation",
@@ -64,7 +64,7 @@ def generate_launch_description():
             }],
             remappings=[
                 # Remap the generic camera topic to the actual hardware topic
-                ("camera/image_raw", "/luxonis/oak/rgb/image_raw"),
+                ("camera/image_raw", "/basler_front/image_color"),
             ],
         )]
     )

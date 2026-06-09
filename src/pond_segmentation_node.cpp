@@ -86,8 +86,7 @@ PondSegmentationNode::PondSegmentationNode(const rclcpp::NodeOptions & options)
 
 void PondSegmentationNode::loadModel()
 {
-  session_options_.SetIntraOpNumThreads(
-    std::max(1u, std::thread::hardware_concurrency()));
+  session_options_.SetIntraOpNumThreads(1);
   session_options_.SetInterOpNumThreads(1);
   session_options_.SetExecutionMode(ExecutionMode::ORT_SEQUENTIAL);
   session_options_.EnableCpuMemArena();
