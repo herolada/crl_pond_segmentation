@@ -14,12 +14,12 @@ def generate_launch_description():
         ),
         DeclareLaunchArgument(
             "rotate_image_180",
-            default_value="false",
+            default_value="true",
             description="Rotate the input image 180° before inference (for upside-down cameras)",
         ),
         DeclareLaunchArgument(
             "segmentation_hz",
-            default_value="0.0",
+            default_value="1.0",
             description="Max segmentation rate in Hz per camera topic; 0.0 means every frame",
         ),
     ]
@@ -27,13 +27,13 @@ def generate_launch_description():
     return LaunchDescription(
         declared_args +
         [Node(
-            package="pond_segmentation",
+            package="crl_pond_segmentation",
             executable="pond_segmentation_node",
             name="pond_segmentation_node",
             output="screen",
             parameters=[{
                 # Path to the ONNX model file installed with the package
-                "model_path": get_package_share_directory("pond_segmentation") + "/models/best_dgx.onnx",
+                "model_path": get_package_share_directory("crl_pond_segmentation") + "/models/best_dgx.onnx",
 
                 # List of image topics to run inference on (one mask published per topic)
                 "camera_topics": ["camera/image_raw"],
